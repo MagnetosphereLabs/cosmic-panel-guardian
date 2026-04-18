@@ -10,8 +10,11 @@ MISS_THRESHOLD=2
 # Tightened to the exact failure family from your logs.
 ERROR_RE='Failed to render, error: An unknown error \(0\)|eglExportDMABUFImageMESA|eglDupNativeFenceFDANDROID|Erroneous EGL call didn.t set EGLError|EGL_BAD_MATCH|EGL_BAD_PARAMETER'
 
-BIN_DIR="${HOME}/.local/bin"
-INSTALL_PATH="${BIN_DIR}/${APP_NAME}"
+APPS_DIR="${HOME}/Apps"
+INSTALL_DIR="${APPS_DIR}/${APP_NAME}"
+INSTALL_PATH="${INSTALL_DIR}/panel-guardian.sh"
+RAW_URL="https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guardian/main/panel-guardian.sh"
+
 UNIT_DIR="${HOME}/.config/systemd/user"
 SERVICE_PATH="${UNIT_DIR}/${APP_NAME}.service"
 TIMER_PATH="${UNIT_DIR}/${APP_NAME}.timer"
@@ -174,15 +177,25 @@ check_once() {
 }
 
 install_units() {
-  mkdir -p "${BIN_DIR}" "${UNIT_DIR}" "${STATE_DIR}"
+  mkdir -p "${INSTALL_DIR}" "${UNIT_DIR}" "${STATE_DIR}"
 
-  local src
-  src="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+  local src tmp
+  src="${BASH_SOURCE[0]-}"
 
-  if [[ "${src}" != "${INSTALL_PATH}" ]]; then
+  if [[ -n "${src}" && -f "${src}" ]]; then
     install -m 0755 "${src}" "${INSTALL_PATH}"
   else
-    chmod 0755 "${INSTALL_PATH}"
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "curl is required for install/update" >&2
+      exit 1
+    fi
+
+    tmp="$(mktemp)"
+    trap 'rm -f "${tmp}"' RETURN
+    curl -fsSL "${RAW_URL}" -o "${tmp}"
+    install -m 0755 "${tmp}" "${INSTALL_PATH}"
+    trap - RETURN
+    rm -f "${tmp}"
   fi
 
   cat > "${SERVICE_PATH}" <<EOF
@@ -191,7 +204,7 @@ Description=COSMIC panel guardian check
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/${APP_NAME} check
+ExecStart=${INSTALL_PATH} check
 Nice=10
 NoNewPrivileges=true
 EOF
@@ -216,6 +229,7 @@ EOF
   systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XDG_SESSION_TYPE XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS >/dev/null 2>&1 || true
 
   echo "Installed ${APP_NAME}"
+  echo "Command: ${INSTALL_PATH}"
   echo "Timer: ${TIMER_PATH}"
   echo "Service: ${SERVICE_PATH}"
   echo "State: ${STATE_DIR}"
@@ -227,6 +241,8 @@ uninstall_units() {
   systemctl --user daemon-reload
   rm -rf "${STATE_DIR}"
   rm -f "${INSTALL_PATH}"
+  rmdir "${INSTALL_DIR}" 2>/dev/null || true
+  rmdir "${APPS_DIR}" 2>/dev/null || true
   echo "Removed ${APP_NAME}"
 }
 
