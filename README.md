@@ -8,20 +8,20 @@ curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guar
 
 To update this service:
 ```
-curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/panel-guardian/main/cosmic-panel-guardian.sh | bash -s -- update
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guardian/main/panel-guardian.sh | bash -s -- update
 ```
 
 To uninstall this service:
 ```
-curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/panel-guardian/main/cosmic-panel-guardian.sh | bash -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guardian/main/panel-guardian.sh | bash -s -- uninstall
 ```
 
 To check the health of this service:
 ```
-curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/panel-guardian/main/cosmic-panel-guardian.sh | bash -s -- status
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guardian/main/panel-guardian.sh | bash -s -- status
 ```
 
 To check the logs of this service:
 ```
-curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/panel-guardian/main/cosmic-panel-guardian.sh | bash -s -- logs
+curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/cosmic-panel-guardian/main/panel-guardian.sh | bash -s -- logs
 ```
