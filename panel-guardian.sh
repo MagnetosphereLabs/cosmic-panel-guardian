@@ -50,7 +50,9 @@ MISS_COUNT_FILE="${STATE_DIR}/miss_count"
 LOCK_FILE="${STATE_DIR}/check.lock"
 LAST_APP_MENU_REPAIR_FILE="${STATE_DIR}/last_app_menu_repair"
 LAST_APP_MENU_START_FILE="${STATE_DIR}/last_app_menu_start"
+LAST_APP_BUTTON_START_FILE="${STATE_DIR}/last_app_button_start"
 APP_MENU_START_COOLDOWN_SEC=2
+APP_BUTTON_START_COOLDOWN_SEC=2
 
 log() {
   mkdir -p "${STATE_DIR}"
@@ -235,13 +237,14 @@ kill_pid_list() {
 
 recover_missing_app_library() {
   local reason="$1"
-  local now last_start before_count after_count owner_before owner_after
+  local mode="${2:-start}"
+  local now last_start before_count after_count owner_before owner_after bad_pids
 
   now="$(date +%s)"
   last_start="$(read_num "${LAST_APP_MENU_START_FILE}" 0)"
 
   if (( now - last_start < APP_MENU_START_COOLDOWN_SEC )); then
-    log "app-menu start cooldown active; skipped direct start (${reason})"
+    log "app-menu start cooldown active; skipped direct recovery (${reason})"
     return 0
   fi
 
@@ -250,14 +253,28 @@ recover_missing_app_library() {
   before_count="$(app_library_count)"
   owner_before="$(app_library_owner_line)"
 
-  log "app-menu direct start triggered: ${reason}; before_count=${before_count}; owner=${owner_before:-none}"
+  log "app-menu direct recovery triggered: ${reason}; mode=${mode}; before_count=${before_count}; owner=${owner_before:-none}"
 
-  # Do not kill launcher/pop-launcher here. This path is for the exact fast-recovery
-  # case where cosmic-app-library crashed and cosmic-session is backing off.
   systemctl --user reset-failed \
     cosmic-app-library.scope \
     'app-cosmic-com.system76.CosmicAppList-*.scope' \
     >/dev/null 2>&1 || true
+
+  # If the process exists but DBus ownership is missing/stale, the backend is
+  # present but unusable. Refresh only cosmic-app-library, not launcher/panel.
+  if [[ "${mode}" == "refresh" ]]; then
+    bad_pids="$(
+      {
+        app_library_pids
+        pgrep -f '(^|/)(ba)?sh[[:space:]]+-c[[:space:]]+cosmic-app-library($|[[:space:]])' 2>/dev/null || true
+      } | awk -v self="$$" '$1 ~ /^[0-9]+$/ && $1 != self { print }' | sort -n -u
+    )"
+
+    if [[ -n "${bad_pids}" ]]; then
+      kill_pid_list TERM <<< "${bad_pids}"
+      sleep 0.2
+    fi
+  fi
 
   start_app_library_direct || true
 
@@ -275,7 +292,7 @@ recover_missing_app_library() {
     >/dev/null 2>&1 || true
 
   owner_after="$(app_library_owner_line)"
-  log "app-menu direct start complete: after_count=${after_count}; owner=${owner_after:-none}"
+  log "app-menu direct recovery complete: after_count=${after_count}; owner=${owner_after:-none}"
 }
 
 app_button_pids() {
@@ -284,29 +301,64 @@ app_button_pids() {
     || true
 }
 
+
+start_app_button_direct() {
+  import_session_env "$(session_pid)"
+
+  local -a env_args
+  env_args=(env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "XDG_SESSION_TYPE=${XDG_SESSION_TYPE}")
+  [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("WAYLAND_DISPLAY=${WAYLAND_DISPLAY}")
+  [[ -n "${DISPLAY:-}" ]] && env_args+=("DISPLAY=${DISPLAY}")
+  [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
+
+  nohup nice -n 19 "${env_args[@]}" cosmic-panel-button com.system76.CosmicAppLibrary >/dev/null 2>&1 &
+}
+
 repair_app_button() {
   local reason="$1"
-  local pids after_count owner_after
+  local now last_start pids after_pids app_count owner_status owner_after
 
+  now="$(date +%s)"
+  last_start="$(read_num "${LAST_APP_BUTTON_START_FILE}" 0)"
   pids="$(app_button_pids)"
-  log "app-button repair triggered: ${reason}; pids=${pids//$'\n'/,}"
 
-  # Only restart the Applications button child, not cosmic-panel itself.
-  # cosmic-panel owns this child and should recreate it without flashing the whole dock/top bar.
+  # Never kill the Applications button. Logs proved cosmic-panel does not
+  # reliably recreate it, which removes the icon.
   if [[ -n "${pids}" ]]; then
-    kill_pid_list TERM <<< "${pids}"
-    sleep 0.4
+    log "app-button event observed but button process exists; no restart (${reason}); pids=${pids//$'\n'/,}"
+    return 0
   fi
 
-  # If the backend app-library is also missing, use the existing fast backend recovery.
-  after_count="$(app_library_count)"
-  if (( after_count < APP_LIBRARY_MIN_PROCS )); then
-    recover_missing_app_library "${reason}; cosmic-app-library missing after app-button repair"
-    after_count="$(app_library_count)"
+  if (( now - last_start < APP_BUTTON_START_COOLDOWN_SEC )); then
+    log "app-button start cooldown active; skipped direct start (${reason})"
+    return 0
+  fi
+
+  printf '%s\n' "${now}" > "${LAST_APP_BUTTON_START_FILE}"
+
+  log "app-button direct start triggered: ${reason}"
+
+  # Make sure the backend exists before restoring the clickable button.
+  app_count="$(app_library_count)"
+  owner_status="$(app_library_owner_status)"
+
+  if (( app_count < APP_LIBRARY_MIN_PROCS )); then
+    recover_missing_app_library "${reason}; backend missing before app-button start"
+  elif [[ "${owner_status}" != "ok" ]]; then
+    recover_missing_app_library "${reason}; backend DBus owner ${owner_status} before app-button start" "refresh"
+  fi
+
+  start_app_button_direct || true
+  sleep 0.4
+
+  after_pids="$(app_button_pids)"
+  if [[ -z "${after_pids}" ]]; then
+    sleep 0.6
+    after_pids="$(app_button_pids)"
   fi
 
   owner_after="$(app_library_owner_line)"
-  log "app-button repair complete: after_count=${after_count}; owner=${owner_after:-none}"
+  log "app-button direct start complete: pids=${after_pids//$'\n'/,}; owner=${owner_after:-none}"
 }
 
 repair_app_menu() {
@@ -395,11 +447,33 @@ check_app_menu() {
 
   app_count="$(app_library_count)"
   owner_status="$(app_library_owner_status)"
-  logs="$(recent_app_menu_logs "${since_epoch}")"
 
+  # Fast live backend recovery. Do this before journal scanning.
+  if (( app_count < APP_LIBRARY_MIN_PROCS )); then
+    reason+="cosmic-app-library process count ${app_count} < ${APP_LIBRARY_MIN_PROCS}; "
+    if [[ "${owner_status}" != "ok" ]]; then
+      reason+="CosmicAppLibrary DBus owner ${owner_status}; "
+    fi
+    recover_missing_app_library "${reason}"
+    return 0
+  fi
+
+  # If there is an app-library process but no valid DBus owner, the backend is
+  # present but unusable. Refresh only app-library; do not kill launcher/panel.
   if [[ "${owner_status}" != "ok" ]]; then
     reason+="CosmicAppLibrary DBus owner ${owner_status}; "
+    recover_missing_app_library "${reason}" "refresh"
+    return 0
   fi
+
+  # Only the true pile-up case uses the heavier repair path.
+  if (( app_count > APP_LIBRARY_MAX_PROCS )); then
+    reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
+    repair_app_menu "${reason}"
+    return 0
+  fi
+
+  logs="$(recent_app_menu_logs "${since_epoch}")"
 
   if grep -Eq "${APP_MENU_FATAL_RE}" <<< "${logs}"; then
     fatal_hit=1
@@ -416,40 +490,16 @@ check_app_menu() {
     reason+="matching app-menu journal signature present; "
   fi
 
-  # Fastest recovery path:
-  # If cosmic-app-library is absent, start it directly instead of waiting for
-  # cosmic-session's exponential backoff or running the heavier full repair.
-  if (( app_count < APP_LIBRARY_MIN_PROCS )); then
-    reason+="cosmic-app-library process count ${app_count} < ${APP_LIBRARY_MIN_PROCS}; "
-    recover_missing_app_library "${reason}"
-    return 0
+  # Journal-only events should not kill anything when live state is healthy.
+  if (( fatal_hit == 1 || scope_hit == 1 || journal_hit == 1 )); then
+    systemctl --user reset-failed \
+      cosmic-app-library.scope \
+      cosmic-launcher.scope \
+      'app-cosmic-com.system76.CosmicAppList-*.scope' \
+      >/dev/null 2>&1 || true
+
+    log "app-menu event observed but live state is healthy; no process restart (${reason})"
   fi
-
-  # Full repair only when a live app-library exists but the state is dirty.
-  if [[ "${owner_status}" != "ok" ]]; then
-    abnormal_state=1
-  fi
-
-  if (( app_count > APP_LIBRARY_MAX_PROCS )); then
-    abnormal_state=1
-    reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
-  fi
-
-  if (( abnormal_state == 0 )); then
-    if (( fatal_hit == 1 || scope_hit == 1 || journal_hit == 1 )); then
-      systemctl --user reset-failed \
-        cosmic-app-library.scope \
-        cosmic-launcher.scope \
-        'app-cosmic-com.system76.CosmicAppList-*.scope' \
-        >/dev/null 2>&1 || true
-
-      log "app-menu event observed but live state is healthy; no process restart (${reason})"
-    fi
-
-    return 0
-  fi
-
-  repair_app_menu "${reason}"
 }
 
 repair_panel() {
@@ -517,6 +567,15 @@ check_once() {
   fi
 
   printf '0\n' > "${MISS_COUNT_FILE}"
+  # Live-state repairs first. These are the cases that make the button appear
+  # dead even before useful journal evidence is processed.
+  check_app_menu "${since_epoch}"
+
+  if [[ -z "$(app_button_pids)" ]]; then
+    repair_app_button "CosmicAppLibrary panel button missing"
+    return 0
+  fi
+
   logs="$(recent_panel_logs "${since_epoch}")"
 
   if grep -Eq "${PANEL_APP_BUTTON_ERROR_RE}" <<< "${logs}"; then
@@ -528,8 +587,6 @@ check_once() {
     repair_panel "render failure signature in cosmic-panel journal"
     return 0
   fi
-
-  check_app_menu "${since_epoch}"
 }
 
 install_units() {
