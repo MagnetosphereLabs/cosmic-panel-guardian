@@ -278,6 +278,37 @@ recover_missing_app_library() {
   log "app-menu direct start complete: after_count=${after_count}; owner=${owner_after:-none}"
 }
 
+app_button_pids() {
+  pgrep -f '(^|/)cosmic-panel-button[[:space:]]+com\.system76\.CosmicAppLibrary($|[[:space:]])' 2>/dev/null \
+    | awk -v self="$$" '$1 ~ /^[0-9]+$/ && $1 != self { print }' \
+    || true
+}
+
+repair_app_button() {
+  local reason="$1"
+  local pids after_count owner_after
+
+  pids="$(app_button_pids)"
+  log "app-button repair triggered: ${reason}; pids=${pids//$'\n'/,}"
+
+  # Only restart the Applications button child, not cosmic-panel itself.
+  # cosmic-panel owns this child and should recreate it without flashing the whole dock/top bar.
+  if [[ -n "${pids}" ]]; then
+    kill_pid_list TERM <<< "${pids}"
+    sleep 0.4
+  fi
+
+  # If the backend app-library is also missing, use the existing fast backend recovery.
+  after_count="$(app_library_count)"
+  if (( after_count < APP_LIBRARY_MIN_PROCS )); then
+    recover_missing_app_library "${reason}; cosmic-app-library missing after app-button repair"
+    after_count="$(app_library_count)"
+  fi
+
+  owner_after="$(app_library_owner_line)"
+  log "app-button repair complete: after_count=${after_count}; owner=${owner_after:-none}"
+}
+
 repair_app_menu() {
   local reason="$1"
   local now last_repair before_count after_count owner_before owner_after related
@@ -489,7 +520,7 @@ check_once() {
   logs="$(recent_panel_logs "${since_epoch}")"
 
   if grep -Eq "${PANEL_APP_BUTTON_ERROR_RE}" <<< "${logs}"; then
-    repair_panel "CosmicPanelAppButton fatal/wgpu failure in cosmic-panel journal"
+    repair_app_button "CosmicPanelAppButton fatal/wgpu failure in cosmic-panel journal"
     return 0
   fi
 
