@@ -16,6 +16,11 @@ APP_LIBRARY_MAX_PROCS=6
 # Tightened to the exact failure family seen from logs.
 ERROR_RE='Failed to render, error: An unknown error \(0\)|eglExportDMABUFImageMESA|eglDupNativeFenceFDANDROID|Erroneous EGL call didn.t set EGLError|EGL_BAD_MATCH|EGL_BAD_PARAMETER'
 
+# COSMIC Applications button itself can crash inside cosmic-panel while
+# cosmic-app-library is already recovered. When this happens, the clicked
+# panel/dock app button can stay dead even though the backend exists.
+PANEL_APP_BUTTON_ERROR_RE='com\.system76\.CosmicPanelAppButton:.*(Handling wgpu errors as fatal|wgpu error: Validation Error|panicked|SCTK failed to send Control::AboutToWait)'
+
 # Observed COSMIC app-library / launcher wedge signatures.
 # Logs alone do not trigger repair; live abnormal state must also be present.
 APP_MENU_ERROR_RE='cosmic-session.*Failed to spawn scope for cosmic-(app-library|launcher).*UnitExists|cosmic-launcher.*Failed to activate another instance|cosmic-panel.*com\.system76\.CosmicPanelAppButton: Terminated|systemd.*app-cosmic-com\.system76\.CosmicAppList-.*Failed with result'
@@ -482,6 +487,11 @@ check_once() {
 
   printf '0\n' > "${MISS_COUNT_FILE}"
   logs="$(recent_panel_logs "${since_epoch}")"
+
+  if grep -Eq "${PANEL_APP_BUTTON_ERROR_RE}" <<< "${logs}"; then
+    repair_panel "CosmicPanelAppButton fatal/wgpu failure in cosmic-panel journal"
+    return 0
+  fi
 
   if grep -Eq "${ERROR_RE}" <<< "${logs}"; then
     repair_panel "render failure signature in cosmic-panel journal"
