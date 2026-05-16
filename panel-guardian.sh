@@ -7,8 +7,16 @@ ACCURACY_SEC=5
 COOLDOWN_SEC=45
 MISS_THRESHOLD=2
 
-# Tightened to the exact failure family from your logs.
+# App-menu repair lane. Conservative threshold so normal open/close behavior is left alone.
+APP_MENU_COOLDOWN_SEC=45
+APP_LIBRARY_MAX_PROCS=6
+
+# Tightened to the exact failure family seen from logs.
 ERROR_RE='Failed to render, error: An unknown error \(0\)|eglExportDMABUFImageMESA|eglDupNativeFenceFDANDROID|Erroneous EGL call didn.t set EGLError|EGL_BAD_MATCH|EGL_BAD_PARAMETER'
+
+# Observed COSMIC app-library / launcher wedge signatures.
+# Logs alone do not trigger repair; live abnormal state must also be present.
+APP_MENU_ERROR_RE='cosmic-session.*Failed to spawn scope for cosmic-(app-library|launcher).*UnitExists|cosmic-launcher.*Failed to activate another instance|cosmic-panel.*com\.system76\.CosmicPanelAppButton: Terminated|systemd.*app-cosmic-com\.system76\.CosmicAppList-.*Failed with result'
 
 APPS_DIR="${HOME}/Apps"
 INSTALL_DIR="${APPS_DIR}/${APP_NAME}"
@@ -24,6 +32,7 @@ LAST_CHECK_FILE="${STATE_DIR}/last_check"
 LAST_RESTART_FILE="${STATE_DIR}/last_restart"
 MISS_COUNT_FILE="${STATE_DIR}/miss_count"
 LOCK_FILE="${STATE_DIR}/check.lock"
+LAST_APP_MENU_REPAIR_FILE="${STATE_DIR}/last_app_menu_repair"
 
 log() {
   mkdir -p "${STATE_DIR}"
@@ -104,6 +113,210 @@ recent_panel_logs() {
   journalctl --user -b --no-pager --since "@${since_epoch}" _COMM=cosmic-panel -o cat 2>/dev/null || true
 }
 
+recent_app_menu_logs() {
+  local since_epoch="$1"
+  journalctl --user -b --no-pager --since "@${since_epoch}" -o short-iso 2>/dev/null \
+    | grep -E 'cosmic-session|cosmic-launcher|cosmic-app-library|cosmic-panel|CosmicAppLibrary|CosmicLauncher|CosmicAppList|app-cosmic-com\.system76\.CosmicAppList|UnitExists|Failed to activate another instance' \
+    || true
+}
+
+proc_cmdline() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+  tr '\0' ' ' < "/proc/${pid}/cmdline" | sed 's/[[:space:]]*$//'
+}
+
+app_library_pids() {
+  local proc pid cmd first base
+
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    cmd="$(proc_cmdline "${pid}" 2>/dev/null || true)"
+    [[ -z "${cmd}" ]] && continue
+
+    first="${cmd%% *}"
+    base="${first##*/}"
+
+    if [[ "${base}" == "cosmic-app-library" ]]; then
+      printf '%s\n' "${pid}"
+    fi
+  done
+}
+
+app_library_count() {
+  app_library_pids | awk 'END { print NR + 0 }'
+}
+
+app_menu_related_pids() {
+  local proc pid cmd first base matched
+
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+
+    # Never signal the guardian itself.
+    [[ "${pid}" == "$$" ]] && continue
+
+    cmd="$(proc_cmdline "${pid}" 2>/dev/null || true)"
+    [[ -z "${cmd}" ]] && continue
+
+    first="${cmd%% *}"
+    base="${first##*/}"
+    matched=0
+
+    case "${base}" in
+      cosmic-app-library|cosmic-launcher|pop-launcher)
+        matched=1
+        ;;
+    esac
+
+    # Shell wrappers observed in the broken state:
+    #   sh -c cosmic-app-library
+    #   /bin/sh -c cosmic-app-library
+    if [[ "${cmd}" =~ ^(/bin/)?sh[[:space:]]+-c[[:space:]]+cosmic-app-library($|[[:space:]]) ]]; then
+      matched=1
+    fi
+
+    # pop-launcher plugin children observed with cosmic-launcher.
+    if [[ "${cmd}" == /usr/lib/pop-launcher/plugins/cosmic_toplevel/cosmic-toplevel* ]]; then
+      matched=1
+    fi
+
+    if [[ "${cmd}" == /usr/lib/pop-launcher/plugins/pop_shell/pop-shell* ]]; then
+      matched=1
+    fi
+
+    if (( matched == 1 )); then
+      printf '%s\n' "${pid}"
+    fi
+  done | sort -n -u
+}
+
+app_library_owner_line() {
+  busctl --user list 2>/dev/null \
+    | awk '$1 == "com.system76.CosmicAppLibrary" { print; exit }' \
+    || true
+}
+
+app_library_owner_status() {
+  local line name pid proc user rest
+
+  line="$(app_library_owner_line)"
+  if [[ -z "${line}" ]]; then
+    printf '%s\n' "missing"
+    return
+  fi
+
+  read -r name pid proc user rest <<< "${line}"
+
+  if [[ -z "${pid:-}" || "${pid}" == "-" || -z "${proc:-}" || "${proc}" == "n/a" || "${proc}" == "-" ]]; then
+    printf '%s\n' "stale"
+    return
+  fi
+
+  printf '%s\n' "ok"
+}
+
+kill_pid_list() {
+  local signal="$1"
+  local pid
+
+  while IFS= read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    [[ "${pid}" == "$$" ]] && continue
+    kill "-${signal}" "${pid}" 2>/dev/null || true
+  done
+}
+
+repair_app_menu() {
+  local reason="$1"
+  local now last_repair before_count after_count owner_before owner_after related
+
+  now="$(date +%s)"
+  last_repair="$(read_num "${LAST_APP_MENU_REPAIR_FILE}" 0)"
+
+  if (( now - last_repair < APP_MENU_COOLDOWN_SEC )); then
+    log "app-menu cooldown active; skipped repair (${reason})"
+    return 0
+  fi
+
+  printf '%s\n' "${now}" > "${LAST_APP_MENU_REPAIR_FILE}"
+
+  before_count="$(app_library_count)"
+  owner_before="$(app_library_owner_line)"
+
+  log "app-menu repair triggered: ${reason}; before_count=${before_count}; owner=${owner_before:-none}"
+
+  # Clean only the scopes involved in the proven app-library / launcher wedge.
+  systemctl --user stop cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
+  systemctl --user reset-failed cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
+
+  sleep 1
+
+  # Terminate only the app-menu / launcher layer.
+  related="$(app_menu_related_pids)"
+  if [[ -n "${related}" ]]; then
+    kill_pid_list TERM <<< "${related}"
+  fi
+
+  sleep 3
+
+  after_count="$(app_library_count)"
+
+  # Escalate only if graceful TERM did not clear the abnormal pile-up.
+  if (( after_count > APP_LIBRARY_MAX_PROCS )); then
+    log "app-menu repair escalating: ${after_count} cosmic-app-library processes remain after TERM"
+    related="$(app_menu_related_pids)"
+    if [[ -n "${related}" ]]; then
+      kill_pid_list KILL <<< "${related}"
+    fi
+    sleep 2
+  fi
+
+  systemctl --user reset-failed cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
+
+  after_count="$(app_library_count)"
+  owner_after="$(app_library_owner_line)"
+
+  log "app-menu repair complete: after_count=${after_count}; owner=${owner_after:-none}"
+}
+
+check_app_menu() {
+  local since_epoch="$1"
+  local app_count owner_status logs reason journal_hit abnormal_state
+
+  reason=""
+  journal_hit=0
+  abnormal_state=0
+
+  app_count="$(app_library_count)"
+  owner_status="$(app_library_owner_status)"
+  logs="$(recent_app_menu_logs "${since_epoch}")"
+
+  if [[ "${owner_status}" != "ok" ]]; then
+    abnormal_state=1
+    reason+="CosmicAppLibrary DBus owner ${owner_status}; "
+  fi
+
+  if (( app_count > APP_LIBRARY_MAX_PROCS )); then
+    abnormal_state=1
+    reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
+  fi
+
+  if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
+    journal_hit=1
+  fi
+
+  # Safety rule:
+  # Journal lines alone do not repair. Live state must also be abnormal.
+  # This prevents closing a healthy Applications menu during normal use.
+  if (( abnormal_state == 1 )); then
+    if (( journal_hit == 1 )); then
+      reason+="matching app-menu journal signature present; "
+    fi
+    repair_app_menu "${reason}"
+  fi
+}
+
 repair_panel() {
   local reason="$1"
   local now last_restart pid
@@ -173,7 +386,10 @@ check_once() {
 
   if grep -Eq "${ERROR_RE}" <<< "${logs}"; then
     repair_panel "render failure signature in cosmic-panel journal"
+    return 0
   fi
+
+  check_app_menu "${since_epoch}"
 }
 
 install_units() {
@@ -205,7 +421,7 @@ Description=COSMIC panel guardian check
 [Service]
 Type=oneshot
 ExecStart=${INSTALL_PATH} check
-Nice=10
+Nice=19
 NoNewPrivileges=true
 EOF
 
@@ -250,19 +466,39 @@ status_cmd() {
   echo "== timer =="
   systemctl --user --no-pager --full status "${APP_NAME}.timer" || true
   echo
+
   echo "== panel process =="
   pgrep -a cosmic-panel || echo "cosmic-panel not running"
   echo
+
+  echo "== app menu state =="
+  echo "cosmic-app-library count: $(app_library_count)"
+  echo "CosmicAppLibrary owner:"
+  app_library_owner_line || true
+  echo
+
+  echo "== launcher/app-library processes =="
+  pgrep -af 'cosmic-launcher|cosmic-app-library|pop-launcher|cosmic-panel-button' | head -n 120 || true
+  echo
+
   echo "== guardian log =="
-  tail -n 25 "${LOG_FILE}" 2>/dev/null || echo "no guardian log yet"
+  tail -n 40 "${LOG_FILE}" 2>/dev/null || echo "no guardian log yet"
 }
 
 logs_cmd() {
+  local since_epoch
+  since_epoch="$(( $(date +%s) - 1200 ))"
+
   echo "== guardian log =="
-  tail -n 50 "${LOG_FILE}" 2>/dev/null || echo "no guardian log yet"
+  tail -n 80 "${LOG_FILE}" 2>/dev/null || echo "no guardian log yet"
   echo
+
   echo "== recent cosmic-panel journal =="
   journalctl --user -b --no-pager _COMM=cosmic-panel -n 120 2>/dev/null || true
+  echo
+
+  echo "== recent app-menu journal =="
+  recent_app_menu_logs "${since_epoch}" | tail -n 160 || true
 }
 
 usage() {
