@@ -20,12 +20,13 @@ ERROR_RE='Failed to render, error: An unknown error \(0\)|eglExportDMABUFImageME
 APP_MENU_ERROR_RE='cosmic-session.*Failed to spawn scope for cosmic-(app-library|launcher).*UnitExists|cosmic-launcher.*Failed to activate another instance|cosmic-panel.*com\.system76\.CosmicPanelAppButton: Terminated|systemd.*app-cosmic-com\.system76\.CosmicAppList-.*Failed with result'
 
 # Fatal render/panic signatures seen when the app menu/button fails to reopen.
-# These DO trigger repair even if DBus/process count already recovered by check time.
+# These are repair context. They only cause a process restart if live app-menu
+# state is also abnormal. If COSMIC already recovered, do not restart it again.
 APP_MENU_FATAL_RE='cosmic-session.*(cosmic-app-library exited with error 101|panicked.*cosmic-app-library|wgpu error: Validation Error|Handling wgpu errors as fatal)|cosmic-panel.*com\.system76\.CosmicPanelAppButton:.*(panicked|wgpu error: Validation Error|Handling wgpu errors as fatal|SCTK failed to send Control::AboutToWait)'
 
-# Fresh app-list scope/resource failures seen when COSMIC launches from the app menu
-# but systemd cannot attach the app scope cleanly. These correlate with the app menu
-# failing, vanishing, or leaving popup/menu state weird.
+# Fresh app-list scope/resource failures seen when COSMIC launches from the app menu.
+# These are repair context. A failed transient AppList scope alone is not enough
+# to kill a healthy cosmic-app-library process.
 APP_MENU_SCOPE_FATAL_RE='app-cosmic-com\.system76\.CosmicAppList-[0-9]+\.scope:.*(PID .* vanished|No PIDs left|Failed with result .resources.|Failed to add PIDs|Failed to start app-cosmic-com\.system76\.CosmicAppList)'
 
 APPS_DIR="${HOME}/Apps"
@@ -256,17 +257,19 @@ repair_app_menu() {
 
 check_app_menu() {
   local since_epoch="$1"
-  local app_count owner_status logs reason journal_hit fatal_hit abnormal_state
+  local app_count owner_status logs reason journal_hit fatal_hit scope_hit abnormal_state
 
   reason=""
   journal_hit=0
   fatal_hit=0
+  scope_hit=0
   abnormal_state=0
 
   app_count="$(app_library_count)"
   owner_status="$(app_library_owner_status)"
   logs="$(recent_app_menu_logs "${since_epoch}")"
 
+  # Live-state checks are the only things that should force a process restart.
   if [[ "${owner_status}" != "ok" ]]; then
     abnormal_state=1
     reason+="CosmicAppLibrary DBus owner ${owner_status}; "
@@ -277,35 +280,38 @@ check_app_menu() {
     reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
   fi
 
-  # the app menu/app button crashes with wgpu/panic, then respawns before
-  # the live DBus/process-count check sees anything abnormal.
+  # Journal signatures are context. They explain why a repair is needed if the
+  # live state is bad, but they should not kill a recovered app-library by themselves.
   if grep -Eq "${APP_MENU_FATAL_RE}" <<< "${logs}"; then
     fatal_hit=1
-    abnormal_state=1
     reason+="fresh app-menu wgpu/panic failure in journal; "
   fi
 
-  # COSMIC AppList scope/resource failures are a separate app-menu failure family.
-  # They can happen when the launched app process vanishes before systemd can attach
-  # it to the app scope, leaving COSMIC's app-menu/popup path in a bad state.
   if grep -Eq "${APP_MENU_SCOPE_FATAL_RE}" <<< "${logs}"; then
-    fatal_hit=1
-    abnormal_state=1
+    scope_hit=1
     reason+="fresh CosmicAppList scope/resource failure in journal; "
   fi
 
   if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
     journal_hit=1
-  fi
-
-  # If nothing live is abnormal and no fresh fatal crash appeared, leave normal
-  # menu open/close behavior alone.
-  if (( abnormal_state == 0 )); then
-    return 0
-  fi
-
-  if (( journal_hit == 1 )); then
     reason+="matching app-menu journal signature present; "
+  fi
+
+  # Fast recovered path:
+  # If COSMIC already respawned app-library and DBus is healthy, do not restart it.
+  # Reset failed transient scope state only, then leave the user's next click alone.
+  if (( abnormal_state == 0 )); then
+    if (( fatal_hit == 1 || scope_hit == 1 || journal_hit == 1 )); then
+      systemctl --user reset-failed \
+        cosmic-app-library.scope \
+        cosmic-launcher.scope \
+        'app-cosmic-com.system76.CosmicAppList-*.scope' \
+        >/dev/null 2>&1 || true
+
+      log "app-menu event observed but live state is healthy; no process restart (${reason})"
+    fi
+
+    return 0
   fi
 
   repair_app_menu "${reason}"
