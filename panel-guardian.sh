@@ -120,75 +120,27 @@ recent_app_menu_logs() {
     || true
 }
 
-proc_cmdline() {
-  local pid="$1"
-  [[ -r "/proc/${pid}/cmdline" ]] || return 1
-  tr '\0' ' ' < "/proc/${pid}/cmdline" | sed 's/[[:space:]]*$//'
-}
-
 app_library_pids() {
-  local proc pid cmd first base
-
-  for proc in /proc/[0-9]*; do
-    pid="${proc##*/}"
-    cmd="$(proc_cmdline "${pid}" 2>/dev/null || true)"
-    [[ -z "${cmd}" ]] && continue
-
-    first="${cmd%% *}"
-    base="${first##*/}"
-
-    if [[ "${base}" == "cosmic-app-library" ]]; then
-      printf '%s\n' "${pid}"
-    fi
-  done
+  pgrep -f '(^|/)cosmic-app-library($|[[:space:]])' 2>/dev/null \
+    | awk -v self="$$" '$1 ~ /^[0-9]+$/ && $1 != self { print }' \
+    || true
 }
 
 app_library_count() {
-  app_library_pids | awk 'END { print NR + 0 }'
+  local count
+  count="$(app_library_pids | wc -l | tr -d '[:space:]')"
+  printf '%s\n' "${count:-0}"
 }
 
 app_menu_related_pids() {
-  local proc pid cmd first base matched
-
-  for proc in /proc/[0-9]*; do
-    pid="${proc##*/}"
-
-    # Never signal the guardian itself.
-    [[ "${pid}" == "$$" ]] && continue
-
-    cmd="$(proc_cmdline "${pid}" 2>/dev/null || true)"
-    [[ -z "${cmd}" ]] && continue
-
-    first="${cmd%% *}"
-    base="${first##*/}"
-    matched=0
-
-    case "${base}" in
-      cosmic-app-library|cosmic-launcher|pop-launcher)
-        matched=1
-        ;;
-    esac
-
-    # Shell wrappers observed in the broken state:
-    #   sh -c cosmic-app-library
-    #   /bin/sh -c cosmic-app-library
-    if [[ "${cmd}" =~ ^(/bin/)?sh[[:space:]]+-c[[:space:]]+cosmic-app-library($|[[:space:]]) ]]; then
-      matched=1
-    fi
-
-    # pop-launcher plugin children observed with cosmic-launcher.
-    if [[ "${cmd}" == /usr/lib/pop-launcher/plugins/cosmic_toplevel/cosmic-toplevel* ]]; then
-      matched=1
-    fi
-
-    if [[ "${cmd}" == /usr/lib/pop-launcher/plugins/pop_shell/pop-shell* ]]; then
-      matched=1
-    fi
-
-    if (( matched == 1 )); then
-      printf '%s\n' "${pid}"
-    fi
-  done | sort -n -u
+  {
+    pgrep -f '(^|/)cosmic-app-library($|[[:space:]])' 2>/dev/null || true
+    pgrep -f '(^|/)cosmic-launcher($|[[:space:]])' 2>/dev/null || true
+    pgrep -f '(^|/)pop-launcher($|[[:space:]])' 2>/dev/null || true
+    pgrep -f '(^|/)(ba)?sh[[:space:]]+-c[[:space:]]+cosmic-app-library($|[[:space:]])' 2>/dev/null || true
+    pgrep -f '^/usr/lib/pop-launcher/plugins/cosmic_toplevel/cosmic-toplevel($|[[:space:]])' 2>/dev/null || true
+    pgrep -f '^/usr/lib/pop-launcher/plugins/pop_shell/pop-shell($|[[:space:]])' 2>/dev/null || true
+  } | awk -v self="$$" '$1 ~ /^[0-9]+$/ && $1 != self { print }' | sort -n -u
 }
 
 app_library_owner_line() {
@@ -212,7 +164,17 @@ app_library_owner_status() {
     printf '%s\n' "stale"
     return
   fi
-
+  
+  if [[ ! "${pid}" =~ ^[0-9]+$ || ! -d "/proc/${pid}" ]]; then
+    printf '%s\n' "stale"
+    return
+  fi
+  
+  if [[ "${proc}" != cosmic-app-libr* && "${proc}" != cosmic-app-library* ]]; then
+    printf '%s\n' "stale"
+    return
+  fi
+  
   printf '%s\n' "ok"
 }
 
@@ -290,7 +252,6 @@ check_app_menu() {
 
   app_count="$(app_library_count)"
   owner_status="$(app_library_owner_status)"
-  logs="$(recent_app_menu_logs "${since_epoch}")"
 
   if [[ "${owner_status}" != "ok" ]]; then
     abnormal_state=1
@@ -302,19 +263,23 @@ check_app_menu() {
     reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
   fi
 
+  # Healthy fast path:
+  # Do not scan app-menu journal when live app-menu state is normal.
+  if (( abnormal_state == 0 )); then
+    return 0
+  fi
+
+  logs="$(recent_app_menu_logs "${since_epoch}")"
+
   if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
     journal_hit=1
   fi
 
-  # Safety rule:
-  # Journal lines alone do not repair. Live state must also be abnormal.
-  # This prevents closing a healthy Applications menu during normal use.
-  if (( abnormal_state == 1 )); then
-    if (( journal_hit == 1 )); then
-      reason+="matching app-menu journal signature present; "
-    fi
-    repair_app_menu "${reason}"
+  if (( journal_hit == 1 )); then
+    reason+="matching app-menu journal signature present; "
   fi
+
+  repair_app_menu "${reason}"
 }
 
 repair_panel() {
