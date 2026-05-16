@@ -10,6 +10,7 @@ MISS_THRESHOLD=2
 # App-menu repair. Faster than the panel-render cooldown because the app menu
 # should recover quickly, while still preventing repeated repair loops.
 APP_MENU_COOLDOWN_SEC=8
+APP_LIBRARY_MIN_PROCS=1
 APP_LIBRARY_MAX_PROCS=6
 
 # Tightened to the exact failure family seen from logs.
@@ -27,8 +28,7 @@ APP_MENU_FATAL_RE='cosmic-session.*(cosmic-app-library exited with error 101|pan
 # Fresh app-list scope/resource failures seen when COSMIC launches from the app menu.
 # These are repair context. A failed transient AppList scope alone is not enough
 # to kill a healthy cosmic-app-library process.
-APP_MENU_SCOPE_FATAL_RE='app-cosmic-com\.system76\.CosmicAppList-[0-9]+\.scope:.*(PID .* vanished|No PIDs left|Failed with result .resources.|Failed to add PIDs|Failed to start app-cosmic-com\.system76\.CosmicAppList)'
-
+APP_MENU_SCOPE_FATAL_RE='(app-cosmic-com\.system76\.CosmicAppList-[0-9]+\.scope|cosmic-app-library\.scope):.*(PID .* vanished|No PIDs left|Couldn.t move process|Failed with result .resources.|Failed to add PIDs|Failed to start app-cosmic-com\.system76\.CosmicAppList|Failed to start cosmic-app-library\.scope)'
 APPS_DIR="${HOME}/Apps"
 INSTALL_DIR="${APPS_DIR}/${APP_NAME}"
 INSTALL_PATH="${INSTALL_DIR}/panel-guardian.sh"
@@ -44,6 +44,8 @@ LAST_RESTART_FILE="${STATE_DIR}/last_restart"
 MISS_COUNT_FILE="${STATE_DIR}/miss_count"
 LOCK_FILE="${STATE_DIR}/check.lock"
 LAST_APP_MENU_REPAIR_FILE="${STATE_DIR}/last_app_menu_repair"
+LAST_APP_MENU_START_FILE="${STATE_DIR}/last_app_menu_start"
+APP_MENU_START_COOLDOWN_SEC=2
 
 log() {
   mkdir -p "${STATE_DIR}"
@@ -74,6 +76,30 @@ session_pid() {
 
 panel_bin() {
   command -v cosmic-panel 2>/dev/null || printf '%s\n' "/usr/bin/cosmic-panel"
+}
+
+app_library_bin() {
+  command -v cosmic-app-library 2>/dev/null || printf '%s\n' "/usr/bin/cosmic-app-library"
+}
+
+start_app_library_direct() {
+  local bin
+  bin="$(app_library_bin)"
+
+  if [[ ! -x "${bin}" ]]; then
+    log "app-menu start fallback failed: cosmic-app-library binary not found"
+    return 1
+  fi
+
+  import_session_env "$(session_pid)"
+
+  local -a env_args
+  env_args=(env "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}" "XDG_SESSION_TYPE=${XDG_SESSION_TYPE}")
+  [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("WAYLAND_DISPLAY=${WAYLAND_DISPLAY}")
+  [[ -n "${DISPLAY:-}" ]] && env_args+=("DISPLAY=${DISPLAY}")
+  [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
+
+  nohup nice -n 19 "${env_args[@]}" "${bin}" >/dev/null 2>&1 &
 }
 
 import_session_env() {
@@ -202,6 +228,51 @@ kill_pid_list() {
   done
 }
 
+recover_missing_app_library() {
+  local reason="$1"
+  local now last_start before_count after_count owner_before owner_after
+
+  now="$(date +%s)"
+  last_start="$(read_num "${LAST_APP_MENU_START_FILE}" 0)"
+
+  if (( now - last_start < APP_MENU_START_COOLDOWN_SEC )); then
+    log "app-menu start cooldown active; skipped direct start (${reason})"
+    return 0
+  fi
+
+  printf '%s\n' "${now}" > "${LAST_APP_MENU_START_FILE}"
+
+  before_count="$(app_library_count)"
+  owner_before="$(app_library_owner_line)"
+
+  log "app-menu direct start triggered: ${reason}; before_count=${before_count}; owner=${owner_before:-none}"
+
+  # Do not kill launcher/pop-launcher here. This path is for the exact fast-recovery
+  # case where cosmic-app-library crashed and cosmic-session is backing off.
+  systemctl --user reset-failed \
+    cosmic-app-library.scope \
+    'app-cosmic-com.system76.CosmicAppList-*.scope' \
+    >/dev/null 2>&1 || true
+
+  start_app_library_direct || true
+
+  sleep 0.4
+  after_count="$(app_library_count)"
+
+  if (( after_count < APP_LIBRARY_MIN_PROCS )); then
+    sleep 0.8
+    after_count="$(app_library_count)"
+  fi
+
+  systemctl --user reset-failed \
+    cosmic-app-library.scope \
+    'app-cosmic-com.system76.CosmicAppList-*.scope' \
+    >/dev/null 2>&1 || true
+
+  owner_after="$(app_library_owner_line)"
+  log "app-menu direct start complete: after_count=${after_count}; owner=${owner_after:-none}"
+}
+
 repair_app_menu() {
   local reason="$1"
   local now last_repair before_count after_count owner_before owner_after related
@@ -225,7 +296,7 @@ repair_app_menu() {
   systemctl --user stop cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
   systemctl --user reset-failed cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
 
-  sleep 0.3
+  sleep 0.2
 
   # Terminate only the app-menu / launcher layer.
   related="$(app_menu_related_pids)"
@@ -233,21 +304,42 @@ repair_app_menu() {
     kill_pid_list TERM <<< "${related}"
   fi
 
-  sleep 1
+  sleep 0.5
 
   after_count="$(app_library_count)"
 
-  # Escalate only if graceful TERM did not clear the abnormal pile-up.
+  # Critical fast path:
+  # If COSMIC crashed app-library and cosmic-session is backing off before restart,
+  # start app-library directly so the next app-button click can work within seconds.
+  if (( after_count < APP_LIBRARY_MIN_PROCS )); then
+    log "app-menu start fallback: no cosmic-app-library present after repair; starting directly"
+    start_app_library_direct || true
+    sleep 0.5
+    after_count="$(app_library_count)"
+  fi
+
+  # Escalate only if graceful TERM did not clear an abnormal pile-up.
   if (( after_count > APP_LIBRARY_MAX_PROCS )); then
     log "app-menu repair escalating: ${after_count} cosmic-app-library processes remain after TERM"
     related="$(app_menu_related_pids)"
     if [[ -n "${related}" ]]; then
       kill_pid_list KILL <<< "${related}"
     fi
-    sleep 2
+    sleep 0.5
+
+    after_count="$(app_library_count)"
+    if (( after_count < APP_LIBRARY_MIN_PROCS )); then
+      log "app-menu start fallback after escalation: starting cosmic-app-library directly"
+      start_app_library_direct || true
+      sleep 0.5
+    fi
   fi
 
-  systemctl --user reset-failed cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
+  systemctl --user reset-failed \
+    cosmic-app-library.scope \
+    cosmic-launcher.scope \
+    'app-cosmic-com.system76.CosmicAppList-*.scope' \
+    >/dev/null 2>&1 || true
 
   after_count="$(app_library_count)"
   owner_after="$(app_library_owner_line)"
@@ -269,19 +361,10 @@ check_app_menu() {
   owner_status="$(app_library_owner_status)"
   logs="$(recent_app_menu_logs "${since_epoch}")"
 
-  # Live-state checks are the only things that should force a process restart.
   if [[ "${owner_status}" != "ok" ]]; then
-    abnormal_state=1
     reason+="CosmicAppLibrary DBus owner ${owner_status}; "
   fi
 
-  if (( app_count > APP_LIBRARY_MAX_PROCS )); then
-    abnormal_state=1
-    reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
-  fi
-
-  # Journal signatures are context. They explain why a repair is needed if the
-  # live state is bad, but they should not kill a recovered app-library by themselves.
   if grep -Eq "${APP_MENU_FATAL_RE}" <<< "${logs}"; then
     fatal_hit=1
     reason+="fresh app-menu wgpu/panic failure in journal; "
@@ -289,7 +372,7 @@ check_app_menu() {
 
   if grep -Eq "${APP_MENU_SCOPE_FATAL_RE}" <<< "${logs}"; then
     scope_hit=1
-    reason+="fresh CosmicAppList scope/resource failure in journal; "
+    reason+="fresh CosmicAppList/app-library scope resource failure in journal; "
   fi
 
   if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
@@ -297,9 +380,25 @@ check_app_menu() {
     reason+="matching app-menu journal signature present; "
   fi
 
-  # Fast recovered path:
-  # If COSMIC already respawned app-library and DBus is healthy, do not restart it.
-  # Reset failed transient scope state only, then leave the user's next click alone.
+  # Fastest recovery path:
+  # If cosmic-app-library is absent, start it directly instead of waiting for
+  # cosmic-session's exponential backoff or running the heavier full repair.
+  if (( app_count < APP_LIBRARY_MIN_PROCS )); then
+    reason+="cosmic-app-library process count ${app_count} < ${APP_LIBRARY_MIN_PROCS}; "
+    recover_missing_app_library "${reason}"
+    return 0
+  fi
+
+  # Full repair only when a live app-library exists but the state is dirty.
+  if [[ "${owner_status}" != "ok" ]]; then
+    abnormal_state=1
+  fi
+
+  if (( app_count > APP_LIBRARY_MAX_PROCS )); then
+    abnormal_state=1
+    reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
+  fi
+
   if (( abnormal_state == 0 )); then
     if (( fatal_hit == 1 || scope_hit == 1 || journal_hit == 1 )); then
       systemctl --user reset-failed \
