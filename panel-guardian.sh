@@ -23,6 +23,11 @@ APP_MENU_ERROR_RE='cosmic-session.*Failed to spawn scope for cosmic-(app-library
 # These DO trigger repair even if DBus/process count already recovered by check time.
 APP_MENU_FATAL_RE='cosmic-session.*(cosmic-app-library exited with error 101|panicked.*cosmic-app-library|wgpu error: Validation Error|Handling wgpu errors as fatal)|cosmic-panel.*com\.system76\.CosmicPanelAppButton:.*(panicked|wgpu error: Validation Error|Handling wgpu errors as fatal|SCTK failed to send Control::AboutToWait)'
 
+# Fresh app-list scope/resource failures seen when COSMIC launches from the app menu
+# but systemd cannot attach the app scope cleanly. These correlate with the app menu
+# failing, vanishing, or leaving popup/menu state weird.
+APP_MENU_SCOPE_FATAL_RE='app-cosmic-com\.system76\.CosmicAppList-[0-9]+\.scope:.*(PID .* vanished|No PIDs left|Failed with result .resources.|Failed to add PIDs|Failed to start app-cosmic-com\.system76\.CosmicAppList)'
+
 APPS_DIR="${HOME}/Apps"
 INSTALL_DIR="${APPS_DIR}/${APP_NAME}"
 INSTALL_PATH="${INSTALL_DIR}/panel-guardian.sh"
@@ -278,6 +283,15 @@ check_app_menu() {
     fatal_hit=1
     abnormal_state=1
     reason+="fresh app-menu wgpu/panic failure in journal; "
+  fi
+
+  # COSMIC AppList scope/resource failures are a separate app-menu failure family.
+  # They can happen when the launched app process vanishes before systemd can attach
+  # it to the app scope, leaving COSMIC's app-menu/popup path in a bad state.
+  if grep -Eq "${APP_MENU_SCOPE_FATAL_RE}" <<< "${logs}"; then
+    fatal_hit=1
+    abnormal_state=1
+    reason+="fresh CosmicAppList scope/resource failure in journal; "
   fi
 
   if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
