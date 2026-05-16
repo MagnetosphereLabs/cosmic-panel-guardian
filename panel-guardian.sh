@@ -2,14 +2,14 @@
 set -euo pipefail
 
 APP_NAME="cosmic-panel-guardian"
-INTERVAL_SEC=5
+INTERVAL_SEC=2
 ACCURACY_SEC=1
 COOLDOWN_SEC=45
 MISS_THRESHOLD=2
 
 # App-menu repair. Faster than the panel-render cooldown because the app menu
 # should recover quickly, while still preventing repeated repair loops.
-APP_MENU_COOLDOWN_SEC=15
+APP_MENU_COOLDOWN_SEC=8
 APP_LIBRARY_MAX_PROCS=6
 
 # Tightened to the exact failure family seen from logs.
@@ -18,6 +18,10 @@ ERROR_RE='Failed to render, error: An unknown error \(0\)|eglExportDMABUFImageME
 # Observed COSMIC app-library / launcher wedge signatures.
 # Logs alone do not trigger repair; live abnormal state must also be present.
 APP_MENU_ERROR_RE='cosmic-session.*Failed to spawn scope for cosmic-(app-library|launcher).*UnitExists|cosmic-launcher.*Failed to activate another instance|cosmic-panel.*com\.system76\.CosmicPanelAppButton: Terminated|systemd.*app-cosmic-com\.system76\.CosmicAppList-.*Failed with result'
+
+# Fatal render/panic signatures seen when the app menu/button fails to reopen.
+# These DO trigger repair even if DBus/process count already recovered by check time.
+APP_MENU_FATAL_RE='cosmic-session.*(cosmic-app-library exited with error 101|panicked.*cosmic-app-library|wgpu error: Validation Error|Handling wgpu errors as fatal)|cosmic-panel.*com\.system76\.CosmicPanelAppButton:.*(panicked|wgpu error: Validation Error|Handling wgpu errors as fatal|SCTK failed to send Control::AboutToWait)'
 
 APPS_DIR="${HOME}/Apps"
 INSTALL_DIR="${APPS_DIR}/${APP_NAME}"
@@ -116,8 +120,10 @@ recent_panel_logs() {
 
 recent_app_menu_logs() {
   local since_epoch="$1"
-  journalctl --user -b --no-pager --since "@${since_epoch}" -o short-iso 2>/dev/null \
-    | grep -E 'cosmic-session|cosmic-launcher|cosmic-app-library|cosmic-panel|CosmicAppLibrary|CosmicLauncher|CosmicAppList|app-cosmic-com\.system76\.CosmicAppList|UnitExists|Failed to activate another instance' \
+
+  journalctl --user -b --no-pager --since "@${since_epoch}" -o short-iso \
+    _COMM=cosmic-session _COMM=cosmic-panel _COMM=cosmic-launcher _COMM=systemd 2>/dev/null \
+    | grep -E 'cosmic-app-library|cosmic-launcher|CosmicAppLibrary|CosmicLauncher|CosmicAppList|CosmicPanelAppButton|app-cosmic-com\.system76\.CosmicAppList|UnitExists|Failed to activate another instance|Failed to spawn scope|Failed with result|Terminated|panicked|wgpu error: Validation Error|Handling wgpu errors as fatal|SCTK failed to send Control::AboutToWait|exited with error 101' \
     || true
 }
 
@@ -213,7 +219,7 @@ repair_app_menu() {
   systemctl --user stop cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
   systemctl --user reset-failed cosmic-app-library.scope cosmic-launcher.scope >/dev/null 2>&1 || true
 
-  sleep 1
+  sleep 0.3
 
   # Terminate only the app-menu / launcher layer.
   related="$(app_menu_related_pids)"
@@ -221,7 +227,7 @@ repair_app_menu() {
     kill_pid_list TERM <<< "${related}"
   fi
 
-  sleep 3
+  sleep 1
 
   after_count="$(app_library_count)"
 
@@ -245,14 +251,16 @@ repair_app_menu() {
 
 check_app_menu() {
   local since_epoch="$1"
-  local app_count owner_status logs reason journal_hit abnormal_state
+  local app_count owner_status logs reason journal_hit fatal_hit abnormal_state
 
   reason=""
   journal_hit=0
+  fatal_hit=0
   abnormal_state=0
 
   app_count="$(app_library_count)"
   owner_status="$(app_library_owner_status)"
+  logs="$(recent_app_menu_logs "${since_epoch}")"
 
   if [[ "${owner_status}" != "ok" ]]; then
     abnormal_state=1
@@ -264,16 +272,22 @@ check_app_menu() {
     reason+="cosmic-app-library process count ${app_count} > ${APP_LIBRARY_MAX_PROCS}; "
   fi
 
-  # Healthy fast path:
-  # Do not scan app-menu journal when live app-menu state is normal.
-  if (( abnormal_state == 0 )); then
-    return 0
+  # the app menu/app button crashes with wgpu/panic, then respawns before
+  # the live DBus/process-count check sees anything abnormal.
+  if grep -Eq "${APP_MENU_FATAL_RE}" <<< "${logs}"; then
+    fatal_hit=1
+    abnormal_state=1
+    reason+="fresh app-menu wgpu/panic failure in journal; "
   fi
-
-  logs="$(recent_app_menu_logs "${since_epoch}")"
 
   if grep -Eq "${APP_MENU_ERROR_RE}" <<< "${logs}"; then
     journal_hit=1
+  fi
+
+  # If nothing live is abnormal and no fresh fatal crash appeared, leave normal
+  # menu open/close behavior alone.
+  if (( abnormal_state == 0 )); then
+    return 0
   fi
 
   if (( journal_hit == 1 )); then
