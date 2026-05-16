@@ -2,13 +2,14 @@
 set -euo pipefail
 
 APP_NAME="cosmic-panel-guardian"
-INTERVAL_SEC=15
-ACCURACY_SEC=5
+INTERVAL_SEC=5
+ACCURACY_SEC=1
 COOLDOWN_SEC=45
 MISS_THRESHOLD=2
 
-# App-menu repair lane. Conservative threshold so normal open/close behavior is left alone.
-APP_MENU_COOLDOWN_SEC=45
+# App-menu repair. Faster than the panel-render cooldown because the app menu
+# should recover quickly, while still preventing repeated repair loops.
+APP_MENU_COOLDOWN_SEC=15
 APP_LIBRARY_MAX_PROCS=6
 
 # Tightened to the exact failure family seen from logs.
